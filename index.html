@@ -375,32 +375,13 @@ function waitForCv() {
 }
 waitForCv();   // start watching now; harmless if cv isn't present yet
 
-// Show a real download percentage for OpenCV. The <script> tag does the actual
-// loading/execution; this streams the same file purely to drive the % readout
-// (cheap locally — same-origin, served from cache). Falls back to an
-// indeterminate bar if the byte size isn't known or the fetch is blocked.
-async function trackOpenCvDownload() {
-  setProgress(-1, 'Loading OpenCV');
-  const tag = document.querySelector('script[src*="opencv"]');
-  if (!tag) return;
-  try {
-    const resp = await fetch(tag.src);
-    const total = +resp.headers.get('content-length') || 0;
-    if (!resp.body || !total) { return; }   // keep indeterminate
-    const reader = resp.body.getReader();
-    let got = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done || cvReady) break;
-      got += value.length;
-      setProgress(Math.min(99, (got / total) * 100), 'Loading OpenCV');
-    }
-    if (!cvReady) setProgress(100, 'Initializing OpenCV');
-  } catch (e) {
-    if (!cvReady) setProgress(-1, 'Loading OpenCV');   // CORS/blocked — stay indeterminate
-  }
-}
-trackOpenCvDownload();
+// OpenCV.js is a large (~8 MB) WebAssembly bundle, and hosts like GitHub Pages
+// serve it gzipped — which makes a byte-accurate percentage impossible (the
+// Content-Length is the compressed size, the stream is decompressed). So show
+// an honest indeterminate bar until the runtime is actually ready, rather than
+// a fake number that sticks at 99%. The <script> tag does the real loading;
+// we don't re-download it.
+setProgress(-1, 'Loading OpenCV (one-time, large file)…');
 
 function cvDone() {
   if (cvReady) return;
