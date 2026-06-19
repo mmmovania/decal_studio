@@ -355,20 +355,28 @@ const nextFrame = () => new Promise((r) => requestAnimationFrame(() => requestAn
 // Poll instead of relying on the <script onload> attribute: in some sandboxes
 // the library finishes loading before this script defines its handler, which
 // throws a ReferenceError. Polling works no matter which loads first.
-let cvTries = 0;
+let cvTries = 0, cvFactoryTried = false;
 function waitForCv() {
-  if (window.cv && cv.Mat) return cvDone();
-  if (window.cv && typeof cv.then === 'function') {
-    cv.then((c) => { window.cv = c; cvDone(); });
+  const c = window.cv;
+  if (c && c.Mat) return cvDone();
+  if (c && typeof c.then === 'function') {           // cv is a Promise
+    c.then((m) => { window.cv = m; cvDone(); });
     return;
   }
-  if (window.cv && cv.onRuntimeInitialized !== undefined && !cv.Mat) {
-    cv.onRuntimeInitialized = cvDone;
+  if (c && typeof c === 'function' && !cvFactoryTried) {   // cv is a factory (MODULARIZE)
+    cvFactoryTried = true;
+    try {
+      const r = c();
+      if (r && typeof r.then === 'function') r.then((m) => { window.cv = m; cvDone(); });
+    } catch (e) { /* not a factory after all — keep polling */ }
+  }
+  if (c && c.onRuntimeInitialized !== undefined && !c.Mat) {
+    c.onRuntimeInitialized = cvDone;
     return;
   }
   if (++cvTries > 250) {   // ~30s
     hideProgress();
-    setStatus('OpenCV failed to load. If running from a file, serve over http (localhost); otherwise check the opencv.js path.', 'err');
+    setStatus('OpenCV did not initialize. Open DevTools → Network and check that opencv.js (and opencv_js.wasm, if present) return 200 with the full file size.', 'err');
     return;
   }
   setTimeout(waitForCv, 120);
