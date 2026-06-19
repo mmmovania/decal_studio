@@ -52,6 +52,13 @@
     margin: 0;
   }
   header .sub { color: var(--muted); font-size: 12px; }
+  header .ver {
+    margin-left: auto;
+    color: var(--muted);
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    opacity: 0.7;
+  }
 
   .layout {
     display: grid;
@@ -220,6 +227,7 @@
 <header>
   <h1>DECAL STUDIO</h1>
   <span class="sub">lift a decal off a garment · fill the hole · place it anywhere</span>
+  <span class="ver" id="ver"></span>
 </header>
 
 <div class="layout">
@@ -289,6 +297,20 @@
    Decal Studio — classical pipeline, no AI prompts
    Stages: load → marquee → GrabCut(extract) + inpaint(fill) → composite
    ============================================================ */
+
+/* ---- BUILD VERSION ----------------------------------------------------
+   Bump this on every deploy. It shows in the header (top-right) and logs to
+   the console, so you can confirm the live site is serving your latest build
+   (GitHub Pages caches, so an unchanged version here = stale deploy). -------- */
+const APP_VERSION = 'v1.0.0';
+const BUILD_DATE = '2026-06-19';
+(function showVersion() {
+  const text = APP_VERSION + ' · ' + BUILD_DATE;
+  console.log('%cDecal Studio ' + text, 'color:#d9774b;font-weight:bold');
+  const paint = () => { const el = document.getElementById('ver'); if (el) el.textContent = text; };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', paint);
+  else paint();
+})();
 
 let cvReady = false;
 let fcanvas = null;          // Fabric canvas (display)
