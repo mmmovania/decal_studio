@@ -1,0 +1,925 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Decal Studio — lift, fill, place</title>
+
+<!-- Fabric.js: canvas + free transform handles (move / rotate / resize) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/fabric.js/5.3.0/fabric.min.js"></script>
+<!-- OpenCV.js: GrabCut segmentation + inpainting (classical, no AI prompts).
+     Served from jsdelivr/npm so it passes restrictive CSPs that block docs.opencv.org.
+     When running locally you can also use https://docs.opencv.org/4.10.0/opencv.js -->
+<script async src="https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.10.0-release.1/dist/opencv.js"></script>
+
+<style>
+  :root {
+    --bg: #14110f;          /* dark workbench */
+    --panel: #1e1a17;
+    --line: #322b26;
+    --ink: #ece4da;         /* warm off-white */
+    --muted: #9a8e82;
+    --accent: #d9774b;      /* clay / decal-ink orange */
+    --accent-dim: #7a4d36;
+    --ok: #7fae6e;
+    --radius: 6px;
+    --font: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font);
+    font-size: 13px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  header {
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+  }
+  header h1 {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    margin: 0;
+  }
+  header .sub { color: var(--muted); font-size: 12px; }
+
+  .layout {
+    display: grid;
+    grid-template-columns: 240px 1fr;
+    min-height: calc(100vh - 51px);
+  }
+
+  /* ---- left rail: control stack ---- */
+  aside {
+    border-right: 1px solid var(--line);
+    padding: 16px 16px;
+    background: var(--panel);
+    display: flex;
+    flex-direction: column;
+  }
+  .group {
+    padding: 14px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .group:first-child { padding-top: 2px; }
+  .group:last-child { border-bottom: none; }
+  .group > *:last-child { margin-bottom: 0; }
+
+  button, label.filebtn {
+    font-family: var(--font);
+    font-size: 12px;
+    color: var(--ink);
+    background: transparent;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 8px 12px;
+    cursor: pointer;
+    width: 100%;
+    text-align: left;
+    transition: border-color 0.12s, color 0.12s, background 0.12s;
+    display: block;
+    margin-bottom: 6px;
+  }
+  button:hover:not(:disabled),
+  label.filebtn:hover { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: 0.35; cursor: not-allowed; }
+  button.primary { border-color: var(--accent-dim); color: var(--accent); }
+  button.primary:hover:not(:disabled) { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  button.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  input[type=file] { display: none; }
+
+  .row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .row label { color: var(--muted); font-size: 11px; flex: 1; }
+  input[type=range] { flex: 1; accent-color: var(--accent); }
+  .val { color: var(--ink); width: 26px; text-align: right; }
+  select.select {
+    flex: 1;
+    font-family: var(--font);
+    font-size: 12px;
+    color: var(--ink);
+    background: #16120f;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 5px 6px;
+    cursor: pointer;
+  }
+  select.select:hover { border-color: var(--accent); }
+  select.select:disabled,
+  input[type=range]:disabled { opacity: 0.35; cursor: not-allowed; }
+  .row:has(:disabled) label { opacity: 0.45; }
+
+  /* ---- stage ---- */
+  main {
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+  }
+  .canvas-wrap {
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    /* faint graph-paper to read alpha/transparency against */
+    background-color: #100d0b;
+    background-image:
+      linear-gradient(45deg, #181412 25%, transparent 25%),
+      linear-gradient(-45deg, #181412 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, #181412 75%),
+      linear-gradient(-45deg, transparent 75%, #181412 75%);
+    background-size: 18px 18px;
+    background-position: 0 0, 0 9px, 9px -9px, -9px 0;
+    line-height: 0;
+  }
+  #stage { display: block; }
+
+  .status {
+    color: var(--muted);
+    font-size: 12px;
+    min-height: 18px;
+    text-align: center;
+  }
+  .status.busy { color: var(--accent); }
+  .status.ok { color: var(--ok); }
+  .status.err { color: #d96b6b; }
+
+  .empty {
+    color: var(--muted);
+    text-align: center;
+    max-width: 360px;
+  }
+  .empty strong { color: var(--ink); display: block; margin-bottom: 6px; font-weight: 600; }
+
+  .hint { color: var(--muted); font-size: 11px; border-top: 1px solid var(--line); padding-top: 12px; margin-top: 4px; }
+  kbd { background: #2a2420; border: 1px solid var(--line); border-radius: 3px; padding: 1px 5px; font-size: 10px; }
+
+  /* zoom / pan controls */
+  .viewbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .vbtn {
+    width: auto;
+    margin: 0;
+    padding: 5px 10px;
+    min-width: 32px;
+    text-align: center;
+    font-size: 14px;
+    line-height: 1;
+  }
+  .vbtn.wide { font-size: 12px; }
+  .zoomval {
+    color: var(--ink);
+    font-size: 12px;
+    min-width: 46px;
+    text-align: center;
+  }
+  .viewhint { color: var(--muted); font-size: 11px; margin-left: 6px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>DECAL STUDIO</h1>
+  <span class="sub">lift a decal off a garment · fill the hole · place it anywhere</span>
+</header>
+
+<div class="layout">
+  <aside>
+    <div class="group">
+      <label class="filebtn" for="file">Choose image…</label>
+      <input type="file" id="file" accept="image/*" />
+    </div>
+
+    <div class="group">
+      <button id="selectBtn" disabled>Draw selection box</button>
+    </div>
+
+    <div class="group">
+      <div class="row">
+        <label for="methodSelect">Fill method</label>
+        <select id="methodSelect" class="select" disabled>
+          <option value="telea">Diffusion (fast)</option>
+          <option value="patch">Patch-based (slow)</option>
+        </select>
+      </div>
+      <div class="row">
+        <label for="iterSlider">GrabCut passes</label>
+        <input type="range" id="iterSlider" min="1" max="10" value="5" disabled />
+        <span class="val" id="iterVal">5</span>
+      </div>
+      <div class="row">
+        <label for="radSlider">Extend region (px)</label>
+        <input type="range" id="radSlider" min="0" max="15" value="3" disabled />
+        <span class="val" id="radVal">3</span>
+      </div>
+      <button id="extractBtn" class="primary" disabled>Lift decal &amp; fill</button>
+    </div>
+
+    <div class="group">
+      <button id="downloadBtn" disabled>Export composite (PNG)</button>
+      <button id="resetBtn" disabled>Start over</button>
+    </div>
+  </aside>
+
+  <main>
+    <div class="viewbar" id="viewbar" style="display:none;">
+      <button id="zoomOutBtn" class="vbtn" title="Zoom out">−</button>
+      <span id="zoomVal" class="zoomval">100%</span>
+      <button id="zoomInBtn" class="vbtn" title="Zoom in">+</button>
+      <button id="zoomFitBtn" class="vbtn wide" title="Reset view">Fit</button>
+      <span class="viewhint">scroll to zoom · hold <kbd>Space</kbd> and drag to pan</span>
+    </div>
+    <div class="canvas-wrap" id="canvasWrap" style="display:none;">
+      <canvas id="stage"></canvas>
+    </div>
+    <div class="empty" id="empty">
+      <strong>Nothing loaded yet</strong>
+      Load a garment image to begin. Everything runs locally in your browser —
+      nothing is uploaded anywhere.
+    </div>
+    <div class="status" id="status">Loading OpenCV…</div>
+  </main>
+</div>
+
+<!-- offscreen canvas holding the source at natural resolution -->
+<canvas id="src" style="display:none;"></canvas>
+
+<script>
+/* ============================================================
+   Decal Studio — classical pipeline, no AI prompts
+   Stages: load → marquee → GrabCut(extract) + inpaint(fill) → composite
+   ============================================================ */
+
+let cvReady = false;
+let fcanvas = null;          // Fabric canvas (display)
+let natW = 0, natH = 0;      // natural image size
+let scale = 1;               // display / natural
+let decal = null;            // the lifted fabric.Image
+let selRect = null;          // marquee rect (display coords)
+let drawing = false, startX = 0, startY = 0;
+let selectMode = false;
+
+/* view state */
+let spaceDown = false;       // hold Space to pan
+let isPanning = false;
+let panX = 0, panY = 0;
+const MIN_ZOOM = 0.15, MAX_ZOOM = 12;
+
+const $ = (id) => document.getElementById(id);
+
+// Bind a listener now if the element exists, else queue it until the DOM is
+// ready. Some sandboxed previews run inline scripts before the body parses,
+// which would otherwise make $('id') return null. Harmless when run locally.
+const _pendingBinds = [];
+function on(id, evt, fn) {
+  const el = $(id);
+  if (el) el.addEventListener(evt, fn);
+  else _pendingBinds.push([id, evt, fn]);
+}
+document.addEventListener('DOMContentLoaded', () => {
+  _pendingBinds.forEach(([id, evt, fn]) => {
+    const el = $(id);
+    if (el) el.addEventListener(evt, fn);
+  });
+});
+
+function setStatus(msg, kind = '') {
+  const el = $('status');
+  if (!el) return;                 // DOM may not be ready yet
+  el.textContent = msg;
+  el.className = 'status ' + kind;
+}
+
+/* ---------- OpenCV.js readiness (robust across builds + load order) ---------- */
+// Poll instead of relying on the <script onload> attribute: in some sandboxes
+// the library finishes loading before this script defines its handler, which
+// throws a ReferenceError. Polling works no matter which loads first.
+function waitForCv() {
+  if (window.cv && cv.Mat) return cvDone();
+  if (window.cv && typeof cv.then === 'function') {
+    cv.then((c) => { window.cv = c; cvDone(); });
+    return;
+  }
+  if (window.cv && cv.onRuntimeInitialized !== undefined && !cv.Mat) {
+    cv.onRuntimeInitialized = cvDone;
+    return;
+  }
+  setTimeout(waitForCv, 120);
+}
+waitForCv();   // start watching now; harmless if cv isn't present yet
+function cvDone() {
+  if (cvReady) return;
+  cvReady = true;
+  setStatus(natW ? 'Ready — draw a selection box around the decal.'
+                 : 'Ready. Load a garment image to begin.', 'ok');
+}
+
+/* ---------- Step 1: load image ---------- */
+on('file', 'change', (e) => {
+  const f = e.target.files && e.target.files[0];
+  if (!f) return;
+  // Read as a data: URL rather than a blob: URL. Some sandboxes rewrite blob
+  // URLs to a blob-request:// scheme their CSP rejects; data: is always allowed
+  // and decodes webp/png/jpg alike. Works the same when run locally.
+  const reader = new FileReader();
+  reader.onload = () => {
+    const img = new Image();
+    img.onload = () => initStage(img);
+    img.onerror = () => setStatus('Could not decode that image.', 'err');
+    img.src = reader.result;            // data:image/...;base64,...
+  };
+  reader.onerror = () => setStatus('Could not read that file.', 'err');
+  reader.readAsDataURL(f);
+});
+
+/* ---------- Default image on startup ---------- */
+// Loads public/grey_jacket.png through the same pipeline as a manual upload.
+// If it isn't found, the app quietly stays on the empty state.
+function loadDefaultImage() {
+  const img = new Image();
+  img.onload = () => initStage(img);
+  img.onerror = () => { /* no default present — leave empty state */ };
+  img.src = 'public/grey_jacket.png';
+}
+if (document.readyState === 'loading')
+  document.addEventListener('DOMContentLoaded', loadDefaultImage);
+else
+  loadDefaultImage();
+
+function initStage(img) {
+  natW = img.naturalWidth;
+  natH = img.naturalHeight;
+
+  // paint source at natural resolution for OpenCV to work on
+  const src = $('src');
+  src.width = natW; src.height = natH;
+  src.getContext('2d').drawImage(img, 0, 0);
+
+  // fit display to a sane size
+  const maxW = 920, maxH = 620;
+  scale = Math.min(maxW / natW, maxH / natH, 1);
+  const dW = Math.round(natW * scale), dH = Math.round(natH * scale);
+
+  if (fcanvas) fcanvas.dispose();
+  fcanvas = new fabric.Canvas('stage', {
+    width: dW, height: dH,
+    selection: false,
+    backgroundColor: 'transparent',
+  });
+
+  fabric.Image.fromURL(img.src, (bg) => {
+    bg.set({ left: 0, top: 0, scaleX: scale, scaleY: scale, selectable: false, evented: false });
+    fcanvas.setBackgroundImage(bg, fcanvas.renderAll.bind(fcanvas));
+  });
+
+  wireMarquee();
+  resetView();
+
+  $('empty').style.display = 'none';
+  $('canvasWrap').style.display = 'block';
+  $('viewbar').style.display = 'flex';
+  decal = null; selRect = null; selectMode = false;
+  $('selectBtn').disabled = false;
+  $('selectBtn').classList.remove('active');
+  $('methodSelect').disabled = true;
+  $('iterSlider').disabled = true;
+  $('radSlider').disabled = true;
+  $('extractBtn').disabled = true;
+  $('downloadBtn').disabled = true;
+  $('resetBtn').disabled = false;
+  setStatus('Loaded. Turn on the selection box and drag around the decal.');
+}
+
+/* ---------- Step 2: marquee selection (display coords) ---------- */
+on('selectBtn', 'click', () => {
+  selectMode = !selectMode;
+  $('selectBtn').classList.toggle('active', selectMode);
+  fcanvas.defaultCursor = selectMode ? 'crosshair' : 'default';
+  if (selectMode && decal) decal.set({ selectable: false, evented: false });
+  setStatus(selectMode ? 'Drag a box loosely around the decal.' : 'Selection off.');
+});
+
+function wireMarquee() {
+  fcanvas.on('mouse:down', (o) => {
+    // Pan takes priority: hold Space (or Alt) and drag.
+    if (spaceDown || o.e.altKey) {
+      isPanning = true;
+      fcanvas.setCursor('grabbing');
+      panX = o.e.clientX; panY = o.e.clientY;
+      return;
+    }
+    if (!selectMode) return;
+    drawing = true;
+    const p = fcanvas.getPointer(o.e);          // scene coords (zoom-independent)
+    startX = p.x; startY = p.y;
+    if (selRect) fcanvas.remove(selRect);
+    selRect = new fabric.Rect({
+      left: startX, top: startY, width: 0, height: 0,
+      fill: 'rgba(217,119,75,0.12)', stroke: '#d9774b',
+      strokeWidth: 1, strokeDashArray: [4, 3], strokeUniform: true,
+      selectable: false, evented: false,
+    });
+    fcanvas.add(selRect);
+  });
+
+  fcanvas.on('mouse:move', (o) => {
+    if (isPanning) {
+      const vpt = fcanvas.viewportTransform;
+      vpt[4] += o.e.clientX - panX;
+      vpt[5] += o.e.clientY - panY;
+      panX = o.e.clientX; panY = o.e.clientY;
+      fcanvas.requestRenderAll();
+      return;
+    }
+    if (!drawing) return;
+    const p = fcanvas.getPointer(o.e);
+    selRect.set({
+      left: Math.min(p.x, startX), top: Math.min(p.y, startY),
+      width: Math.abs(p.x - startX), height: Math.abs(p.y - startY),
+    });
+    fcanvas.renderAll();
+  });
+
+  fcanvas.on('mouse:up', () => {
+    if (isPanning) {
+      isPanning = false;
+      fcanvas.setCursor(spaceDown ? 'grab' : (selectMode ? 'crosshair' : 'default'));
+      return;
+    }
+    if (!drawing) return;
+    drawing = false;
+    const ok = selRect && selRect.width > 8 && selRect.height > 8;
+    $('extractBtn').disabled = !ok;
+    if (ok) {
+      $('methodSelect').disabled = false;
+      $('iterSlider').disabled = false;
+      $('radSlider').disabled = false;
+    }
+    setStatus(ok ? 'Box set. Adjust fill options, then lift the decal.' : 'Box too small — try again.');
+  });
+
+  // Scroll wheel zooms toward the cursor.
+  fcanvas.on('mouse:wheel', (o) => {
+    let zoom = fcanvas.getZoom() * Math.pow(0.999, o.e.deltaY);
+    zoom = Math.min(Math.max(zoom, MIN_ZOOM), MAX_ZOOM);
+    fcanvas.zoomToPoint({ x: o.e.offsetX, y: o.e.offsetY }, zoom);
+    updateZoomLabel();
+    o.e.preventDefault();
+    o.e.stopPropagation();
+  });
+}
+
+/* Space-to-pan: while held, ignore objects so drags pan the canvas. */
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' && !spaceDown && fcanvas && !e.repeat) {
+    const tag = (e.target.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea') return;
+    spaceDown = true;
+    fcanvas.skipTargetFind = true;          // drags become pans, not object moves
+    fcanvas.defaultCursor = 'grab';
+    fcanvas.setCursor('grab');
+    e.preventDefault();
+  }
+});
+window.addEventListener('keyup', (e) => {
+  if (e.code === 'Space' && fcanvas) {
+    spaceDown = false;
+    fcanvas.skipTargetFind = false;
+    fcanvas.defaultCursor = selectMode ? 'crosshair' : 'default';
+    fcanvas.setCursor(fcanvas.defaultCursor);
+  }
+});
+
+function applyZoom(factor) {
+  if (!fcanvas) return;
+  let zoom = Math.min(Math.max(fcanvas.getZoom() * factor, MIN_ZOOM), MAX_ZOOM);
+  // zoom around the canvas center
+  fcanvas.zoomToPoint({ x: fcanvas.getWidth() / 2, y: fcanvas.getHeight() / 2 }, zoom);
+  updateZoomLabel();
+}
+
+function resetView() {
+  if (!fcanvas) return;
+  fcanvas.setViewportTransform([1, 0, 0, 1, 0, 0]);
+  updateZoomLabel();
+}
+
+function updateZoomLabel() {
+  const el = $('zoomVal');
+  if (el && fcanvas) el.textContent = Math.round(fcanvas.getZoom() * 100) + '%';
+}
+
+on('zoomInBtn', 'click', () => applyZoom(1.2));
+on('zoomOutBtn', 'click', () => applyZoom(1 / 1.2));
+on('zoomFitBtn', 'click', resetView);
+
+/* sliders */
+on('iterSlider', 'input', (e) => ($('iterVal').textContent = e.target.value));
+on('radSlider', 'input', (e) => ($('radVal').textContent = e.target.value));
+
+/* ---------- Step 3: GrabCut extract + inpaint fill ---------- */
+on('extractBtn', 'click', () => {
+  if (!cvReady) return setStatus('OpenCV still loading…', 'err');
+  const slow = $('methodSelect').value === 'patch';
+  setStatus(slow ? 'Lifting decal — patch fill can take a few seconds…' : 'Lifting decal…', 'busy');
+  // let the status paint before the heavy synchronous work
+  setTimeout(runExtract, 30);
+});
+
+function runExtract() {
+  // map the display-space box to natural pixels
+  const r = {
+    x: Math.round(selRect.left / scale),
+    y: Math.round(selRect.top / scale),
+    w: Math.round(selRect.width / scale),
+    h: Math.round(selRect.height / scale),
+  };
+  r.x = Math.max(1, Math.min(r.x, natW - 2));
+  r.y = Math.max(1, Math.min(r.y, natH - 2));
+  r.w = Math.max(2, Math.min(r.w, natW - r.x - 1));
+  r.h = Math.max(2, Math.min(r.h, natH - r.y - 1));
+
+  const sctx = $('src').getContext('2d');
+  const imgData = sctx.getImageData(0, 0, natW, natH);
+
+  let rgba, rgb, mask, bgd, fgd, fgMask, inpMask, inpainted, inpRGBA;
+  let openK, labels, stats, centroids;
+  try {
+    rgba = cv.matFromImageData(imgData);          // CV_8UC4 (RGBA)
+    rgb = new cv.Mat();
+    cv.cvtColor(rgba, rgb, cv.COLOR_RGBA2RGB);    // GrabCut wants 3-channel
+
+    // --- GrabCut: separate foreground from background within the box ---
+    mask = new cv.Mat();
+    bgd = new cv.Mat();
+    fgd = new cv.Mat();
+    const iters = parseInt($('iterSlider').value, 10);
+    cv.grabCut(rgb, mask, new cv.Rect(r.x, r.y, r.w, r.h),
+               bgd, fgd, iters, cv.GC_INIT_WITH_RECT);
+
+    // mask labels: 0=BGD 1=FGD 2=PR_BGD 3=PR_FGD.  (v & 1) -> 1 for FGD/PR_FGD.
+    fgMask = new cv.Mat(natH, natW, cv.CV_8UC1);
+    let foundFg = false;
+    for (let i = 0; i < mask.data.length; i++) {
+      const fg = (mask.data[i] & 1) ? 255 : 0;
+      fgMask.data[i] = fg;
+      if (fg) foundFg = true;
+    }
+    if (!foundFg) throw new Error('No foreground found — try a tighter box or more passes.');
+
+    // --- Clean the mask ---
+    // 1) Morphological open removes lone speckle pixels.
+    openK = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3, 3));
+    cv.morphologyEx(fgMask, fgMask, cv.MORPH_OPEN, openK);
+
+    // 2) Keep only sizeable connected blobs. GrabCut sometimes flags a stray
+    //    patch of fabric as foreground; those small islands are what show up as
+    //    a white smudge clinging to the decal. Drop anything well below the
+    //    largest blob, but keep genuinely multi-part decals.
+    labels = new cv.Mat();
+    stats = new cv.Mat();
+    centroids = new cv.Mat();
+    const nLabels = cv.connectedComponentsWithStats(fgMask, labels, stats, centroids, 8, cv.CV_32S);
+    if (nLabels > 2) {                          // >1 foreground component present
+      let maxArea = 0;
+      for (let l = 1; l < nLabels; l++) {
+        const a = stats.intAt(l, cv.CC_STAT_AREA);
+        if (a > maxArea) maxArea = a;
+      }
+      const minKeep = maxArea * 0.15;           // ditch islands < 15% of the main blob
+      const keep = new Uint8Array(nLabels);
+      for (let l = 1; l < nLabels; l++) {
+        if (stats.intAt(l, cv.CC_STAT_AREA) >= minKeep) keep[l] = 1;
+      }
+      const lab = labels.data32S;
+      for (let i = 0; i < fgMask.data.length; i++) {
+        fgMask.data[i] = keep[lab[i]] ? 255 : 0;
+      }
+    }
+
+    // tight bounding box of the cut, so the decal isn't padded with empties
+    let minX = natW, minY = natH, maxX = -1, maxY = -1;
+    for (let y = 0; y < natH; y++) {
+      for (let x = 0; x < natW; x++) {
+        if (fgMask.data[y * natW + x]) {
+          if (x < minX) minX = x; if (x > maxX) maxX = x;
+          if (y < minY) minY = y; if (y > maxY) maxY = y;
+        }
+      }
+    }
+    // After speckle-removal + component filtering the mask can come back empty
+    // on a low-contrast decal. Bail with a clear message rather than building a
+    // zero/negative-sized ImageData (which throws an opaque IndexSizeError).
+    if (maxX < minX || maxY < minY) {
+      throw new Error('Couldn’t isolate a decal in that box — try a tighter box, a higher-contrast area, or more GrabCut passes.');
+    }
+    const bb = { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
+
+    // --- Build the decal as RGBA with alpha = foreground mask ---
+    const decalData = new ImageData(bb.w, bb.h);
+    for (let y = 0; y < bb.h; y++) {
+      for (let x = 0; x < bb.w; x++) {
+        const si = (bb.y + y) * natW + (bb.x + x);
+        const di = (y * bb.w + x) * 4;
+        if (fgMask.data[si]) {
+          decalData.data[di]     = imgData.data[si * 4];
+          decalData.data[di + 1] = imgData.data[si * 4 + 1];
+          decalData.data[di + 2] = imgData.data[si * 4 + 2];
+          decalData.data[di + 3] = 255;
+        } else {
+          decalData.data[di + 3] = 0;           // background -> transparent
+        }
+      }
+    }
+    const decalURL = imageDataToURL(decalData);
+
+    // --- Inpaint the hole left behind ---
+    // Fill the decal region grown outward by `margin` pixels. Extending past the
+    // decal pushes the fill boundary off the decal's bright soft edge and onto
+    // clean garment, so the inpainter samples real fabric colour (killing the
+    // halo) while still covering the decal's anti-aliased fringe. Tighter than
+    // filling the whole box, so the patch blends.
+    const margin = parseInt($('radSlider').value, 10);
+    inpMask = new cv.Mat();
+    const dk = cv.getStructuringElement(cv.MORPH_ELLIPSE,
+                                        new cv.Size(margin * 2 + 1, margin * 2 + 1));
+    cv.dilate(fgMask, inpMask, dk);
+    dk.delete();
+
+    let filledData;
+    if ($('methodSelect').value === 'patch') {
+      // Patch-based (Criminisi-style exemplar) fill: copies real fabric patches
+      // into the hole instead of diffusing edge color, so texture and lighting
+      // survive. Pure JS, runs on a bounded crop around the hole.
+      const hole = new Uint8Array(natW * natH);
+      for (let i = 0; i < hole.length; i++) hole[i] = inpMask.data[i] ? 1 : 0;
+      const filled = patchInpaint(imgData.data, natW, natH, hole, { patch: 9 });
+      filledData = new ImageData(filled, natW, natH);
+    } else {
+      // Diffusion (Telea): fast, smooth, smears texture on heavy fabric.
+      inpainted = new cv.Mat();
+      cv.inpaint(rgb, inpMask, inpainted, 3, cv.INPAINT_TELEA);   // 3px synthesis radius
+      inpRGBA = new cv.Mat();
+      cv.cvtColor(inpainted, inpRGBA, cv.COLOR_RGB2RGBA);
+      filledData = new ImageData(new Uint8ClampedArray(inpRGBA.data), natW, natH);
+    }
+
+    // Restore the source's alpha. Inpainting only changes RGB inside the hole;
+    // every other pixel — including an originally-transparent background — must
+    // keep its original alpha. (Telea drops the alpha channel and rebuilds it as
+    // fully opaque, which is what was turning the transparent surround into solid
+    // black.) The hole sits on opaque fabric, so its alpha restores to 255.
+    const fa = filledData.data, oa = imgData.data;
+    for (let i = 3; i < fa.length; i += 4) fa[i] = oa[i];
+
+    const filledURL = imageDataToURL(filledData);
+
+    // --- Composite: filled background + draggable decal on top ---
+    fabric.Image.fromURL(filledURL, (bg) => {
+      bg.set({ left: 0, top: 0, scaleX: scale, scaleY: scale, selectable: false, evented: false });
+      fcanvas.setBackgroundImage(bg, fcanvas.renderAll.bind(fcanvas));
+
+      fabric.Image.fromURL(decalURL, (d) => {
+        d.set({
+          left: bb.x * scale, top: bb.y * scale,
+          scaleX: scale, scaleY: scale,
+          cornerColor: '#d9774b', cornerStyle: 'circle',
+          borderColor: '#d9774b', transparentCorners: false,
+          cornerSize: 9, padding: 2,
+        });
+        if (selRect) { fcanvas.remove(selRect); selRect = null; }
+        decal = d;
+        fcanvas.add(d).setActiveObject(d);
+        fcanvas.renderAll();
+      });
+    });
+
+    // turn marquee off, hand control to the placement tool
+    selectMode = false;
+    $('selectBtn').classList.remove('active');
+    fcanvas.defaultCursor = 'default';
+    $('extractBtn').disabled = true;
+    $('downloadBtn').disabled = false;
+    setStatus('Lifted. Drag to move · corners scale · top handle rotates.', 'ok');
+  } catch (err) {
+    console.error(err);
+    setStatus(err.message || 'Extraction failed.', 'err');
+  } finally {
+    // OpenCV.js does not garbage-collect Mats — free them by hand.
+    [rgba, rgb, mask, bgd, fgd, fgMask, inpMask, inpainted, inpRGBA,
+     openK, labels, stats, centroids]
+      .forEach((m) => { try { m && m.delete(); } catch (e) {} });
+  }
+}
+
+function imageDataToURL(imgData) {
+  const c = document.createElement('canvas');
+  c.width = imgData.width; c.height = imgData.height;
+  c.getContext('2d').putImageData(imgData, 0, 0);
+  return c.toDataURL('image/png');
+}
+
+/* ----------------------------------------------------------------------
+   Patch-based (Criminisi-style exemplar) inpainting — classical, no AI.
+
+   Instead of diffusing boundary color inward (Telea), this copies whole
+   patches of real fabric from around the hole into the hole, choosing each
+   patch to (a) extend strong edges first (priority = confidence x data term)
+   and (b) best match the already-known pixels of the target patch (SSD).
+   Texture and lighting survive, which is the whole point.
+
+   Runs on a cropped box around the hole with a bounded search window, so cost
+   stays manageable and the borrowed texture stays local. Returns a new RGBA
+   array; the input is not modified.
+   ---------------------------------------------------------------------- */
+function patchInpaint(srcRGBA, W, H, holeMask, opts = {}) {
+  const patch = opts.patch || 9;
+  const half = (patch - 1) >> 1;
+
+  // hole bounding box
+  let minX = W, minY = H, maxX = -1, maxY = -1;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    if (holeMask[y * W + x]) {
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+    }
+  }
+  const out = new Uint8ClampedArray(srcRGBA);
+  if (maxX < 0) return out;                       // nothing to fill
+
+  const holeW = maxX - minX + 1, holeH = maxY - minY + 1;
+  const searchMargin = opts.searchMargin ||
+    Math.min(64, Math.max(24, Math.round(Math.max(holeW, holeH) * 0.75)));
+  const pad = searchMargin + half + 1;
+
+  // crop region (clamped to image)
+  const cx0 = Math.max(0, minX - pad), cy0 = Math.max(0, minY - pad);
+  const cx1 = Math.min(W - 1, maxX + pad), cy1 = Math.min(H - 1, maxY + pad);
+  const cw = cx1 - cx0 + 1, ch = cy1 - cy0 + 1, N = cw * ch;
+
+  // local working buffers
+  const R = new Float32Array(N), G = new Float32Array(N), B = new Float32Array(N);
+  const gray = new Float32Array(N), conf = new Float32Array(N);
+  const fill = new Uint8Array(N);
+  let remaining = 0;
+  for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+    const li = y * cw + x, s = ((cy0 + y) * W + (cx0 + x)) * 4;
+    R[li] = srcRGBA[s]; G[li] = srcRGBA[s + 1]; B[li] = srcRGBA[s + 2];
+    gray[li] = 0.299 * R[li] + 0.587 * G[li] + 0.114 * B[li];
+    const h = holeMask[(cy0 + y) * W + (cx0 + x)] ? 1 : 0;
+    fill[li] = h; conf[li] = h ? 0 : 1; if (h) remaining++;
+  }
+
+  const idx = (x, y) => y * cw + x;
+  const inb = (x, y) => x >= 0 && y >= 0 && x < cw && y < ch;
+
+  let guard = N * 4;                              // hard stop against stalls
+  while (remaining > 0 && guard-- > 0) {
+    // 1) fill front: hole pixels touching a known pixel
+    const front = [];
+    for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+      const i = idx(x, y);
+      if (!fill[i]) continue;
+      if ((inb(x - 1, y) && !fill[idx(x - 1, y)]) || (inb(x + 1, y) && !fill[idx(x + 1, y)]) ||
+          (inb(x, y - 1) && !fill[idx(x, y - 1)]) || (inb(x, y + 1) && !fill[idx(x, y + 1)])) {
+        front.push(i);
+      }
+    }
+    if (front.length === 0) break;
+
+    // 2) priority = confidence term x data term; pick the max
+    let bestP = -1, target = front[0];
+    for (const i of front) {
+      const px = i % cw, py = (i / cw) | 0;
+      let cs = 0, cnt = 0;
+      for (let dy = -half; dy <= half; dy++) for (let dx = -half; dx <= half; dx++) {
+        const xx = px + dx, yy = py + dy; if (!inb(xx, yy)) continue;
+        cnt++; if (!fill[idx(xx, yy)]) cs += conf[idx(xx, yy)];
+      }
+      const Cp = cnt ? cs / cnt : 0;
+      // normal to the fill front (gradient of the mask)
+      const fl = inb(px - 1, py) ? fill[idx(px - 1, py)] : 1;
+      const fr = inb(px + 1, py) ? fill[idx(px + 1, py)] : 1;
+      const fu = inb(px, py - 1) ? fill[idx(px, py - 1)] : 1;
+      const fd = inb(px, py + 1) ? fill[idx(px, py + 1)] : 1;
+      let nx = fr - fl, ny = fd - fu; const nn = Math.hypot(nx, ny) || 1; nx /= nn; ny /= nn;
+      // isophote (image gradient rotated 90°) over known pixels
+      const gl = (inb(px - 1, py) && !fill[idx(px - 1, py)]) ? gray[idx(px - 1, py)] : gray[i];
+      const gr = (inb(px + 1, py) && !fill[idx(px + 1, py)]) ? gray[idx(px + 1, py)] : gray[i];
+      const gu = (inb(px, py - 1) && !fill[idx(px, py - 1)]) ? gray[idx(px, py - 1)] : gray[i];
+      const gd = (inb(px, py + 1) && !fill[idx(px, py + 1)]) ? gray[idx(px, py + 1)] : gray[i];
+      const ix = -(gd - gu) / 2, iy = (gr - gl) / 2;
+      const Dp = (Math.abs(ix * nx + iy * ny) + 1) / 255;   // +1 keeps flat areas progressing
+      const P = Cp * Dp;
+      if (P > bestP) { bestP = P; target = i; }
+    }
+    const tx = target % cw, ty = (target / cw) | 0;
+
+    // 3) best-matching fully-known exemplar patch within the search window
+    let bestSSD = Infinity, bx = -1, by = -1;
+    const sx0 = Math.max(half, tx - searchMargin), sx1 = Math.min(cw - 1 - half, tx + searchMargin);
+    const sy0 = Math.max(half, ty - searchMargin), sy1 = Math.min(ch - 1 - half, ty + searchMargin);
+    for (let qy = sy0; qy <= sy1; qy++) for (let qx = sx0; qx <= sx1; qx++) {
+      let ok = true, ssd = 0;
+      for (let dy = -half; dy <= half && ok; dy++) {
+        for (let dx = -half; dx <= half; dx++) {
+          const qi = idx(qx + dx, qy + dy);
+          if (fill[qi]) { ok = false; break; }     // candidate must be fully known
+          const txx = tx + dx, tyy = ty + dy; if (!inb(txx, tyy)) continue;
+          const ti = idx(txx, tyy); if (fill[ti]) continue;   // compare known target px only
+          const dr = R[qi] - R[ti], dg = G[qi] - G[ti], db = B[qi] - B[ti];
+          ssd += dr * dr + dg * dg + db * db;
+          if (ssd >= bestSSD) { ok = false; break; }
+        }
+      }
+      if (ok && ssd < bestSSD) { bestSSD = ssd; bx = qx; by = qy; }
+    }
+
+    if (bx < 0) {
+      // No fully-known patch nearby (rare): fill one pixel from known neighbours
+      // so the front keeps advancing.
+      let ar = 0, ag = 0, ab = 0, c = 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const xx = tx + dx, yy = ty + dy; if (!inb(xx, yy)) continue;
+        const j = idx(xx, yy); if (!fill[j]) { ar += R[j]; ag += G[j]; ab += B[j]; c++; }
+      }
+      if (!c) break;
+      R[target] = ar / c; G[target] = ag / c; B[target] = ab / c;
+      gray[target] = 0.299 * R[target] + 0.587 * G[target] + 0.114 * B[target];
+      fill[target] = 0; conf[target] = 0.1; remaining--;
+      continue;
+    }
+
+    // 4) copy exemplar into the unknown target pixels; propagate confidence
+    let cs = 0, cnt = 0;
+    for (let dy = -half; dy <= half; dy++) for (let dx = -half; dx <= half; dx++) {
+      const xx = tx + dx, yy = ty + dy; if (!inb(xx, yy)) continue;
+      cnt++; if (!fill[idx(xx, yy)]) cs += conf[idx(xx, yy)];
+    }
+    const Cfill = cnt ? cs / cnt : 0;
+    for (let dy = -half; dy <= half; dy++) for (let dx = -half; dx <= half; dx++) {
+      const txx = tx + dx, tyy = ty + dy; if (!inb(txx, tyy)) continue;
+      const ti = idx(txx, tyy); if (!fill[ti]) continue;
+      const qi = idx(bx + dx, by + dy);
+      R[ti] = R[qi]; G[ti] = G[qi]; B[ti] = B[qi];
+      gray[ti] = 0.299 * R[ti] + 0.587 * G[ti] + 0.114 * B[ti];
+      fill[ti] = 0; conf[ti] = Cfill; remaining--;
+    }
+  }
+
+  // write the filled crop back into the output
+  for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+    const li = idx(x, y), gi = ((cy0 + y) * W + (cx0 + x)) * 4;
+    out[gi] = R[li]; out[gi + 1] = G[li]; out[gi + 2] = B[li]; out[gi + 3] = 255;
+  }
+  return out;
+}
+
+/* ---------- Step 4: export / reset ---------- */
+on('downloadBtn', 'click', () => {
+  if (decal) decal.set({ borderColor: 'transparent' });
+  fcanvas.discardActiveObject();
+  // Neutralize zoom/pan for export, then restore — otherwise the PNG is cropped.
+  const savedVpt = fcanvas.viewportTransform.slice();
+  fcanvas.setViewportTransform([1, 0, 0, 1, 0, 0]);
+  fcanvas.renderAll();
+  const url = fcanvas.toDataURL({ format: 'png', multiplier: 1 / scale }); // export at natural res
+  fcanvas.setViewportTransform(savedVpt);
+  fcanvas.renderAll();
+  const a = document.createElement('a');
+  a.href = url; a.download = 'composite.png'; a.click();
+  setStatus('Exported composite.png at full resolution.', 'ok');
+});
+
+on('resetBtn', 'click', () => {
+  if (fcanvas) { fcanvas.dispose(); fcanvas = null; }
+  $('canvasWrap').style.display = 'none';
+  $('viewbar').style.display = 'none';
+  $('empty').style.display = 'block';
+  $('file').value = '';
+  decal = null; selRect = null; selectMode = false;
+  $('selectBtn').disabled = true;
+  $('selectBtn').classList.remove('active');
+  $('methodSelect').disabled = true;
+  $('iterSlider').disabled = true;
+  $('radSlider').disabled = true;
+  $('extractBtn').disabled = true;
+  $('downloadBtn').disabled = true;
+  $('resetBtn').disabled = true;
+  setStatus('Cleared. Load a garment image to begin.');
+});
+</script>
+</body>
+</html>
