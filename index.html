@@ -220,6 +220,30 @@
     0%   { transform: translateX(-120%); }
     100% { transform: translateX(320%); }
   }
+
+  /* edge-debug strip */
+  label.check {
+    display: flex; align-items: center; gap: 7px;
+    color: var(--muted); font-size: 11px; margin: 8px 0 0;
+    cursor: pointer; user-select: none;
+  }
+  label.check input { accent-color: var(--accent); cursor: pointer; }
+  .debug {
+    display: flex; flex-wrap: wrap; gap: 14px;
+    justify-content: center; margin-top: 16px;
+    padding-top: 14px; border-top: 1px solid var(--line);
+  }
+  .debug figure { margin: 0; text-align: center; }
+  .debug canvas {
+    display: block; width: 150px; height: auto;
+    image-rendering: pixelated;
+    border: 1px solid var(--line); border-radius: 4px;
+    background: #100d0b;
+  }
+  .debug figcaption {
+    margin-top: 5px; color: var(--muted);
+    font-size: 10px; letter-spacing: 0.03em;
+  }
 </style>
 </head>
 <body>
@@ -243,6 +267,17 @@
 
     <div class="group">
       <div class="row">
+        <label for="detectSelect">Detect</label>
+        <select id="detectSelect" class="select" disabled>
+          <option value="grabcut">Color (GrabCut)</option>
+          <option value="eqgrabcut">Equalized + GrabCut</option>
+          <option value="clahegrabcut">CLAHE + GrabCut</option>
+          <option value="edges">Edges (emboss)</option>
+          <option value="hull">Edges → convex hull</option>
+          <option value="sam">SAM (AI)</option>
+        </select>
+      </div>
+      <div class="row">
         <label for="methodSelect">Fill method</label>
         <select id="methodSelect" class="select" disabled>
           <option value="telea">Diffusion (fast)</option>
@@ -254,6 +289,12 @@
         <input type="range" id="iterSlider" min="1" max="10" value="5" disabled />
         <span class="val" id="iterVal">5</span>
       </div>
+      <div class="row">
+        <label for="edgeSlider">Edge sensitivity</label>
+        <input type="range" id="edgeSlider" min="1" max="100" value="60" disabled />
+        <span class="val" id="edgeVal">60</span>
+      </div>
+      <label class="check"><input type="checkbox" id="debugEdges" /> Show edge steps (debug)</label>
       <div class="row">
         <label for="radSlider">Extend region (px)</label>
         <input type="range" id="radSlider" min="0" max="15" value="3" disabled />
@@ -286,6 +327,14 @@
     </div>
     <div class="status" id="status">Loading OpenCV…</div>
     <div class="progress" id="progress" style="display:none;"><div class="progress-fill" id="progressFill"></div></div>
+    <div class="debug" id="debugPanel" style="display:none;">
+      <figure><canvas id="dbgGray"></canvas><figcaption>1 · ROI gray</figcaption></figure>
+      <figure><canvas id="dbgBlur"></canvas><figcaption>2 · low-pass</figcaption></figure>
+      <figure><canvas id="dbgEq"></canvas><figcaption>3 · equalize</figcaption></figure>
+      <figure><canvas id="dbgEdges"></canvas><figcaption>4 · Canny edges</figcaption></figure>
+      <figure><canvas id="dbgClosed"></canvas><figcaption>5 · closed</figcaption></figure>
+      <figure><canvas id="dbgFilled"></canvas><figcaption>6 · filled mask</figcaption></figure>
+    </div>
   </main>
 </div>
 
@@ -302,8 +351,8 @@
    Bump this on every deploy. It shows in the header (top-right) and logs to
    the console, so you can confirm the live site is serving your latest build
    (GitHub Pages caches, so an unchanged version here = stale deploy). -------- */
-const APP_VERSION = 'v1.0.0';
-const BUILD_DATE = '2026-06-19';
+const APP_VERSION = 'v1.6.1';
+const BUILD_DATE = '2026-06-24';
 (function showVersion() {
   const text = APP_VERSION + ' · ' + BUILD_DATE;
   console.log('%cDecal Studio ' + text, 'color:#d9774b;font-weight:bold');
@@ -320,6 +369,9 @@ let decal = null;            // the lifted fabric.Image
 let selRect = null;          // marquee rect (display coords)
 let drawing = false, startX = 0, startY = 0;
 let selectMode = false;
+// SAM (Segment Anything) state — model/processor cached across images,
+// embeddings cached per image (cleared when a new image loads).
+let samModel = null, samProcessor = null, samTF = null, samEmbeddings = null;
 
 /* view state */
 let spaceDown = false;       // hold Space to pan
@@ -486,10 +538,13 @@ function initStage(img) {
   $('canvasWrap').style.display = 'block';
   $('viewbar').style.display = 'flex';
   decal = null; selRect = null; selectMode = false;
+  samEmbeddings = null;        // new image — embeddings no longer valid
   $('selectBtn').disabled = false;
   $('selectBtn').classList.remove('active');
+  $('detectSelect').disabled = true;
   $('methodSelect').disabled = true;
   $('iterSlider').disabled = true;
+  $('edgeSlider').disabled = true;
   $('radSlider').disabled = true;
   $('extractBtn').disabled = true;
   $('downloadBtn').disabled = true;
@@ -558,11 +613,13 @@ function wireMarquee() {
     const ok = selRect && selRect.width > 8 && selRect.height > 8;
     $('extractBtn').disabled = !ok;
     if (ok) {
+      $('detectSelect').disabled = false;
       $('methodSelect').disabled = false;
       $('iterSlider').disabled = false;
+      $('edgeSlider').disabled = false;
       $('radSlider').disabled = false;
     }
-    setStatus(ok ? 'Box set. Adjust fill options, then lift the decal.' : 'Box too small — try again.');
+    setStatus(ok ? 'Box set. Adjust options, then lift the decal.' : 'Box too small — try again.');
   });
 
   // Scroll wheel zooms toward the cursor.
@@ -622,6 +679,7 @@ on('zoomFitBtn', 'click', resetView);
 
 /* sliders */
 on('iterSlider', 'input', (e) => ($('iterVal').textContent = e.target.value));
+on('edgeSlider', 'input', (e) => ($('edgeVal').textContent = e.target.value));
 on('radSlider', 'input', (e) => ($('radVal').textContent = e.target.value));
 
 /* ---------- Step 3: GrabCut extract + inpaint fill ---------- */
@@ -657,23 +715,59 @@ async function runExtract() {
     rgb = new cv.Mat();
     cv.cvtColor(rgba, rgb, cv.COLOR_RGBA2RGB);    // GrabCut wants 3-channel
 
-    // --- GrabCut: separate foreground from background within the box ---
-    mask = new cv.Mat();
-    bgd = new cv.Mat();
-    fgd = new cv.Mat();
-    const iters = parseInt($('iterSlider').value, 10);
-    cv.grabCut(rgb, mask, new cv.Rect(r.x, r.y, r.w, r.h),
-               bgd, fgd, iters, cv.GC_INIT_WITH_RECT);
-
-    // mask labels: 0=BGD 1=FGD 2=PR_BGD 3=PR_FGD.  (v & 1) -> 1 for FGD/PR_FGD.
-    fgMask = new cv.Mat(natH, natW, cv.CV_8UC1);
+    // --- Foreground detection ---
+    const detect = $('detectSelect').value;
     let foundFg = false;
-    for (let i = 0; i < mask.data.length; i++) {
-      const fg = (mask.data[i] & 1) ? 255 : 0;
-      fgMask.data[i] = fg;
-      if (fg) foundFg = true;
+    if (detect === 'edges' || detect === 'hull') {
+      // Edge/emboss mode. GrabCut keys off colour, which a same-colour embossed
+      // logo doesn't have — its signal is the relief (edges). So detect edges,
+      // close them into loops, and build the foreground from the closed regions.
+      // 'edges' fills every region; 'hull' keeps the largest + its convex hull.
+      // (mask/bgd/fgd stay unused here.)
+      const dbg = $('debugEdges').checked;
+      $('debugPanel').style.display = dbg ? 'flex' : 'none';
+      const mode = (detect === 'hull') ? 'hull' : 'contours';
+      fgMask = edgeForegroundMask(rgb, r, parseInt($('edgeSlider').value, 10), dbg, mode);
+      for (let i = 0; i < fgMask.data.length; i++) { if (fgMask.data[i]) { foundFg = true; break; } }
+      if (!foundFg) throw new Error('No closed regions found — raise Edge sensitivity, draw a tighter box, or use Color mode.');
+    } else if (detect === 'eqgrabcut' || detect === 'clahegrabcut') {
+      // Boost the relief into real intensity contrast, then GrabCut on it.
+      // CLAHE equalizes in local tiles (resists broad lighting gradients);
+      // plain equalize is global.
+      const dbg = $('debugEdges').checked;
+      $('debugPanel').style.display = dbg ? 'flex' : 'none';
+      const useClahe = (detect === 'clahegrabcut');
+      fgMask = eqGrabCutMask(rgb, r, parseInt($('iterSlider').value, 10), dbg, useClahe);
+      for (let i = 0; i < fgMask.data.length; i++) { if (fgMask.data[i]) { foundFg = true; break; } }
+      if (!foundFg) throw new Error('GrabCut found no foreground even after ' + (useClahe ? 'CLAHE' : 'equalizing') + ' — try Edges mode or a tighter box.');
+    } else if (detect === 'sam') {
+      // Segment Anything. The selection rect is SAM's box prompt directly.
+      $('debugPanel').style.display = 'none';
+      setProgress(15, 'Loading SAM'); await nextFrame();
+      await ensureSam();
+      setProgress(35, 'Segmenting (SAM)'); await nextFrame();
+      fgMask = await samForegroundMask(r);
+      for (let i = 0; i < fgMask.data.length; i++) { if (fgMask.data[i]) { foundFg = true; break; } }
+      if (!foundFg) throw new Error('SAM returned an empty mask — try a tighter box around the decal.');
+    } else {
+      // GrabCut: separate foreground from background within the box by colour.
+      $('debugPanel').style.display = 'none';
+      mask = new cv.Mat();
+      bgd = new cv.Mat();
+      fgd = new cv.Mat();
+      const iters = parseInt($('iterSlider').value, 10);
+      cv.grabCut(rgb, mask, new cv.Rect(r.x, r.y, r.w, r.h),
+                 bgd, fgd, iters, cv.GC_INIT_WITH_RECT);
+
+      // mask labels: 0=BGD 1=FGD 2=PR_BGD 3=PR_FGD.  (v & 1) -> 1 for FGD/PR_FGD.
+      fgMask = new cv.Mat(natH, natW, cv.CV_8UC1);
+      for (let i = 0; i < mask.data.length; i++) {
+        const fg = (mask.data[i] & 1) ? 255 : 0;
+        fgMask.data[i] = fg;
+        if (fg) foundFg = true;
+      }
+      if (!foundFg) throw new Error('No foreground found — try a tighter box or more passes.');
     }
-    if (!foundFg) throw new Error('No foreground found — try a tighter box or more passes.');
 
     // --- Clean the mask ---
     setProgress(48, 'Cleaning mask'); await nextFrame();
@@ -836,6 +930,263 @@ function imageDataToURL(imgData) {
   c.width = imgData.width; c.height = imgData.height;
   c.getContext('2d').putImageData(imgData, 0, 0);
   return c.toDataURL('image/png');
+}
+
+// Render an OpenCV Mat into a debug canvas (no-op if the canvas is absent).
+function dbgShow(id, mat) {
+  const c = $(id);
+  if (!c || !mat) return;
+  try { cv.imshow(c, mat); } catch (e) { /* ignore */ }
+}
+
+/* ----------------------------------------------------------------------
+   SAM (Segment Anything) via transformers.js — the one AI mode.
+
+   Loaded lazily from a CDN on first use, so the five classical modes stay
+   fully offline and unaffected if this fails. SlimSAM (a distilled SAM) keeps
+   the download to tens of MB and runs on plain WASM, with WebGPU used when the
+   browser exposes it. The selection rect maps directly to SAM's native box
+   prompt, so no extra UI is needed. Image embeddings are computed once per
+   image and reused across boxes.
+
+   Note: the model weights are fetched from the model host, so this only works
+   where that host is reachable (e.g. a normal deployment) — not in a sandbox
+   that blocks it. The other modes need no network at all.
+   ---------------------------------------------------------------------- */
+const SAM_MODEL = 'Xenova/slimsam-77-uniform';
+const SAM_CDN = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.2';
+
+async function ensureSam() {
+  if (samModel && samProcessor) return;
+  if (!samTF) {
+    try {
+      samTF = await import(/* @vite-ignore */ SAM_CDN);
+      samTF.env.allowLocalModels = false;
+    } catch (e) {
+      throw new Error('Could not load the SAM runtime (needs network access). The other modes work offline.');
+    }
+  }
+  samProcessor = await samTF.AutoProcessor.from_pretrained(SAM_MODEL);
+  // Prefer WebGPU (fast) with fp16; fall back to WASM (slower) with int8.
+  try {
+    const opts = navigator.gpu ? { device: 'webgpu', dtype: 'fp16' } : { device: 'wasm', dtype: 'q8' };
+    samModel = await samTF.SamModel.from_pretrained(SAM_MODEL, opts);
+  } catch (e) {
+    samModel = await samTF.SamModel.from_pretrained(SAM_MODEL, { device: 'wasm', dtype: 'q8' });
+  }
+}
+
+// Run SAM with the selection rect as a box prompt; returns a full-size
+// CV_8UC1 mask (255 = foreground). Caller frees it.
+async function samForegroundMask(rect) {
+  const TF = samTF;
+  const imgData = $('src').getContext('2d').getImageData(0, 0, natW, natH);
+  const raw = new TF.RawImage(imgData.data, natW, natH, 4).rgb();
+
+  if (!samEmbeddings) {
+    const imageInputs = await samProcessor(raw);
+    samEmbeddings = await samModel.get_image_embeddings(imageInputs);
+  }
+
+  // SlimSAM's decoder takes input_points/input_labels (there is no input_boxes
+  // input in the graph). A box is encoded the way SAM does it internally: its
+  // two corners as points, labelled 2 (top-left) and 3 (bottom-right).
+  //   input_points: [batch][num_points][x, y]    input_labels: [batch][num_points]
+  const x1 = rect.x, y1 = rect.y, x2 = rect.x + rect.w, y2 = rect.y + rect.h;
+  const input_points = [[[x1, y1], [x2, y2]]];
+  const input_labels = [[2, 3]];
+  const inputs = await samProcessor(raw, { input_points, input_labels });
+
+  let outputs;
+  try {
+    // fast path: reuse cached embeddings with the new prompt
+    outputs = await samModel({
+      ...samEmbeddings,
+      input_points: inputs.input_points,
+      input_labels: inputs.input_labels,
+    });
+  } catch (e) {
+    // robust fallback: full forward (re-encodes the image)
+    outputs = await samModel(inputs);
+  }
+
+  const masksList = await samProcessor.post_process_masks(
+    outputs.pred_masks, inputs.original_sizes, inputs.reshaped_input_sizes);
+  const masks = masksList[0];                 // Tensor [num_boxes, num_masks, H, W]
+  const [, numMasks, H, W] = masks.dims;
+
+  // pick the highest-confidence of SAM's multi-mask outputs
+  const iou = outputs.iou_scores.data;
+  let best = 0, bestScore = -Infinity;
+  for (let m = 0; m < numMasks; m++) { if (iou[m] > bestScore) { bestScore = iou[m]; best = m; } }
+
+  const md = masks.data;
+  const off = best * H * W;
+  let small = new cv.Mat(H, W, cv.CV_8UC1);
+  for (let i = 0; i < H * W; i++) small.data[i] = md[off + i] ? 255 : 0;
+
+  let out;
+  if (W !== natW || H !== natH) {             // post_process should already match, but be safe
+    out = new cv.Mat();
+    cv.resize(small, out, new cv.Size(natW, natH), 0, 0, cv.INTER_NEAREST);
+    small.delete();
+  } else {
+    out = small;
+  }
+  return out;
+}
+
+/* ----------------------------------------------------------------------
+   Equalized + GrabCut. For a faint embossed logo there's no colour contrast,
+   but histogram-equalizing the grayscale turns the subtle relief shading into
+   real intensity contrast — enough for GrabCut to separate. We equalize a crop
+   around the selection (so GrabCut still has a background border to learn from),
+   replicate to 3 channels, and run GrabCut with the user's rect. Returns a
+   full-size CV_8UC1 mask; frees its own temporaries.
+   ---------------------------------------------------------------------- */
+function eqGrabCutMask(rgb, rect, iters, debug, useClahe) {
+  const out = cv.Mat.zeros(rgb.rows, rgb.cols, cv.CV_8UC1);
+  let gray, crop, eq, eq3, mask, bgd, fgd, cropMask, dst;
+  try {
+    // crop = rect + margin, so background surrounds the rect for GrabCut
+    const m = Math.round(Math.max(rect.w, rect.h) * 0.35) + 2;
+    const cx = Math.max(0, rect.x - m), cy = Math.max(0, rect.y - m);
+    const cx1 = Math.min(rgb.cols, rect.x + rect.w + m);
+    const cy1 = Math.min(rgb.rows, rect.y + rect.h + m);
+    const cw = cx1 - cx, ch = cy1 - cy;
+
+    gray = new cv.Mat();
+    cv.cvtColor(rgb, gray, cv.COLOR_RGB2GRAY);
+    const gview = gray.roi(new cv.Rect(cx, cy, cw, ch));
+    crop = new cv.Mat(); gview.copyTo(crop); gview.delete();
+    if (debug) dbgShow('dbgGray', crop);
+
+    // Contrast boost: global equalize, or CLAHE (local tiles — resists broad
+    // lighting gradients, so GrabCut latches onto the relief, not the lighting).
+    eq = new cv.Mat();
+    if (useClahe) {
+      try {
+        const clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
+        clahe.apply(crop, eq);
+        clahe.delete();
+      } catch (e) {
+        cv.equalizeHist(crop, eq);              // fallback if CLAHE unavailable
+      }
+    } else {
+      cv.equalizeHist(crop, eq);
+    }
+    if (debug) { dbgShow('dbgBlur', eq); dbgShow('dbgEq', eq); }
+
+    eq3 = new cv.Mat();
+    cv.cvtColor(eq, eq3, cv.COLOR_GRAY2RGB);      // GrabCut wants 3 channels
+
+    mask = new cv.Mat(); bgd = new cv.Mat(); fgd = new cv.Mat();
+    const rc = new cv.Rect(rect.x - cx, rect.y - cy, rect.w, rect.h);
+    cv.grabCut(eq3, mask, rc, bgd, fgd, iters, cv.GC_INIT_WITH_RECT);
+
+    cropMask = new cv.Mat(ch, cw, cv.CV_8UC1);
+    for (let i = 0; i < mask.data.length; i++) {
+      cropMask.data[i] = (mask.data[i] & 1) ? 255 : 0;   // FGD | PR_FGD
+    }
+    if (debug) { dbgShow('dbgEdges', cropMask); dbgShow('dbgClosed', cropMask); dbgShow('dbgFilled', cropMask); }
+
+    dst = out.roi(new cv.Rect(cx, cy, cw, ch));
+    cropMask.copyTo(dst);
+  } finally {
+    [gray, crop, eq, eq3, mask, bgd, fgd, cropMask, dst]
+      .forEach((x) => { try { x && x.delete(); } catch (e) {} });
+  }
+  return out;
+}
+
+/* ----------------------------------------------------------------------
+   Edge-based foreground for low-contrast / embossed decals.
+
+   GrabCut separates by colour; a same-colour embossed logo has none — its only
+   signal is the relief, which shows up as faint edges. So: boost contrast,
+   run Canny, morphologically CLOSE the edges into continuous loops, then find
+   the closed contours and fill them. The filled regions become the foreground.
+   Works inside the selection rect; returns a full-size CV_8UC1 mask (255 = fg).
+   Frees all its own temporaries; the returned mask is freed by the caller.
+   ---------------------------------------------------------------------- */
+function edgeForegroundMask(rgb, rect, sensitivity, debug, mode) {
+  const out = cv.Mat.zeros(rgb.rows, rgb.cols, cv.CV_8UC1);
+  let gray, g, edges, k, contours, hierarchy, roiMask, dst;
+  try {
+    gray = new cv.Mat();
+    cv.cvtColor(rgb, gray, cv.COLOR_RGB2GRAY);
+
+    // work on the selection ROI only
+    const roiView = gray.roi(new cv.Rect(rect.x, rect.y, rect.w, rect.h));
+    g = new cv.Mat(); roiView.copyTo(g); roiView.delete();
+    if (debug) dbgShow('dbgGray', g);
+
+    // suppress fabric grain, then stretch contrast to reveal faint relief edges
+    cv.GaussianBlur(g, g, new cv.Size(3, 3), 0, 0, cv.BORDER_DEFAULT);
+    if (debug) dbgShow('dbgBlur', g);
+    cv.equalizeHist(g, g);
+    if (debug) dbgShow('dbgEq', g);
+
+    // Canny — higher sensitivity (1..100) lowers thresholds to catch fainter edges
+    const lo = Math.max(5, 110 - sensitivity);
+    edges = new cv.Mat();
+    cv.Canny(g, edges, lo, lo * 2.5);
+    if (debug) dbgShow('dbgEdges', edges);
+
+    // close gaps so broken outlines become traceable closed loops
+    k = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3, 3));
+    cv.morphologyEx(edges, edges, cv.MORPH_CLOSE, k, new cv.Point(-1, -1), 2);
+    cv.dilate(edges, edges, k);
+    if (debug) dbgShow('dbgClosed', edges);
+
+    // find closed regions
+    contours = new cv.MatVector();
+    hierarchy = new cv.Mat();
+    cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    roiMask = cv.Mat.zeros(rect.h, rect.w, cv.CV_8UC1);
+
+    if (mode === 'hull') {
+      // Keep only the largest contour, fill it, then also fill its convex hull.
+      // Gives one clean solid shape for roughly-convex logos (crest/shield),
+      // bridging gaps the close step left in the outline.
+      let maxArea = 0, maxIdx = -1;
+      for (let i = 0; i < contours.size(); i++) {
+        const cnt = contours.get(i);
+        const a = cv.contourArea(cnt);
+        if (a > maxArea) { maxArea = a; maxIdx = i; }
+        cnt.delete();
+      }
+      if (maxIdx >= 0) {
+        cv.drawContours(roiMask, contours, maxIdx, new cv.Scalar(255), -1);
+        const best = contours.get(maxIdx);
+        const hull = new cv.Mat();
+        cv.convexHull(best, hull, false, true);
+        const hullVec = new cv.MatVector();
+        hullVec.push_back(hull);
+        cv.drawContours(roiMask, hullVec, 0, new cv.Scalar(255), -1);
+        best.delete(); hull.delete(); hullVec.delete();
+      }
+    } else {
+      // Fill every sizeable closed region.
+      const minArea = rect.w * rect.h * 0.01;        // ignore tiny noise contours
+      for (let i = 0; i < contours.size(); i++) {
+        const cnt = contours.get(i);
+        if (cv.contourArea(cnt) >= minArea) {
+          cv.drawContours(roiMask, contours, i, new cv.Scalar(255), -1);
+        }
+        cnt.delete();
+      }
+    }
+    cv.erode(roiMask, roiMask, k);                  // undo the closing dilation
+    if (debug) dbgShow('dbgFilled', roiMask);
+
+    dst = out.roi(new cv.Rect(rect.x, rect.y, rect.w, rect.h));
+    roiMask.copyTo(dst);
+  } finally {
+    [gray, g, edges, k, contours, hierarchy, roiMask, dst]
+      .forEach((m) => { try { m && m.delete(); } catch (e) {} });
+  }
+  return out;
 }
 
 /* ----------------------------------------------------------------------
@@ -1030,14 +1381,18 @@ on('resetBtn', 'click', () => {
   $('empty').style.display = 'block';
   $('file').value = '';
   decal = null; selRect = null; selectMode = false;
+  samEmbeddings = null;
   $('selectBtn').disabled = true;
   $('selectBtn').classList.remove('active');
+  $('detectSelect').disabled = true;
   $('methodSelect').disabled = true;
   $('iterSlider').disabled = true;
+  $('edgeSlider').disabled = true;
   $('radSlider').disabled = true;
   $('extractBtn').disabled = true;
   $('downloadBtn').disabled = true;
   $('resetBtn').disabled = true;
+  $('debugPanel').style.display = 'none';
   setStatus('Cleared. Load a garment image to begin.');
 });
 </script>
