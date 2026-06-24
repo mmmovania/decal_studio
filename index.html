@@ -476,29 +476,43 @@ function cvDone() {
 /* ---------- Step 1: load image ---------- */
 on('file', 'change', (e) => {
   const f = e.target.files && e.target.files[0];
-  if (!f) return;
-  // Read as a data: URL rather than a blob: URL. Some sandboxes rewrite blob
-  // URLs to a blob-request:// scheme their CSP rejects; data: is always allowed
-  // and decodes webp/png/jpg alike. Works the same when run locally.
-  const reader = new FileReader();
-  reader.onload = () => {
-    const img = new Image();
-    img.onload = () => initStage(img);
-    img.onerror = () => setStatus('Could not decode that image.', 'err');
-    img.src = reader.result;            // data:image/...;base64,...
-  };
-  reader.onerror = () => setStatus('Could not read that file.', 'err');
-  reader.readAsDataURL(f);
+  if (f) decodeAndInit(f);
 });
 
+// Decode WITHOUT colour conversion so the canvas gets the image's raw encoded
+// pixels. By default the browser gamut-maps an image's embedded profile (often
+// wide-gamut Display P3 from phone cameras) into the canvas's sRGB space, which
+// desaturates saturated colours — that was shifting the extracted decal's hue.
+// colorSpaceConversion:'none' keeps the original numbers. Falls back to a plain
+// <img> decode if createImageBitmap (or the option) isn't supported.
+async function decodeAndInit(blob) {
+  try {
+    const bmp = await createImageBitmap(blob, {
+      colorSpaceConversion: 'none',
+      imageOrientation: 'from-image',
+    });
+    initStage(bmp);
+  } catch (err) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => initStage(img);
+      img.onerror = () => setStatus('Could not decode that image.', 'err');
+      img.src = reader.result;
+    };
+    reader.onerror = () => setStatus('Could not read that file.', 'err');
+    reader.readAsDataURL(blob);
+  }
+}
+
 /* ---------- Default image on startup ---------- */
-// Loads public/grey_jacket.png through the same pipeline as a manual upload.
+// Loads public/grey_jacket.png through the same raw-decode pipeline as uploads.
 // If it isn't found, the app quietly stays on the empty state.
 function loadDefaultImage() {
-  const img = new Image();
-  img.onload = () => initStage(img);
-  img.onerror = () => { /* no default present — leave empty state */ };
-  img.src = 'public/grey_jacket.png';
+  fetch('public/grey_jacket.png')
+    .then((r) => (r.ok ? r.blob() : Promise.reject()))
+    .then(decodeAndInit)
+    .catch(() => { /* no default present — leave empty state */ });
 }
 if (document.readyState === 'loading')
   document.addEventListener('DOMContentLoaded', loadDefaultImage);
@@ -506,8 +520,8 @@ else
   loadDefaultImage();
 
 function initStage(img) {
-  natW = img.naturalWidth;
-  natH = img.naturalHeight;
+  natW = img.naturalWidth || img.width;     // HTMLImageElement | ImageBitmap
+  natH = img.naturalHeight || img.height;
 
   // paint source at natural resolution for OpenCV to work on
   const src = $('src');
@@ -526,7 +540,9 @@ function initStage(img) {
     backgroundColor: 'transparent',
   });
 
-  fabric.Image.fromURL(img.src, (bg) => {
+  // Background comes from the SAME raw-decoded canvas as the decal, so the
+  // displayed garment and the lifted decal share one colour space (no mismatch).
+  fabric.Image.fromURL(src.toDataURL('image/png'), (bg) => {
     bg.set({ left: 0, top: 0, scaleX: scale, scaleY: scale, selectable: false, evented: false });
     fcanvas.setBackgroundImage(bg, fcanvas.renderAll.bind(fcanvas));
   });
